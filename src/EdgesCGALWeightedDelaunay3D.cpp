@@ -1,7 +1,7 @@
 // EdgesCGALWeightedDelaunay3D.cpp
 // Fast extraction of the 1-skeleton of the 3D Regular Triangulation (Weighted Delaunay) using CGAL.
-// Input: .xyzw with lines "x y z w" (w = CGAL power weight = squared radius).
-// Output: lines "i j" with 0-based indices of endpoints of each finite edge.
+// Input: two .npy files: points.npy with shape (N,3) and weights.npy with shape (N,).
+// Output: edges.npy containing Nx2 uint32_t pairs of sorted indices of each finite edge.
 #include <CGAL/Exact_predicates_inexact_constructions_kernel.h>
 #include <CGAL/Regular_triangulation_3.h>
 #include <CGAL/Regular_triangulation_vertex_base_3.h>
@@ -15,8 +15,6 @@
 #include <cstring>
 #include <vector>
 #include <string>
-#include <fstream>
-#include <iostream>
 #include <limits>
 #include <utility>
 #include <algorithm>
@@ -40,26 +38,118 @@ struct BBox {
     bool valid() const { return xmin <= xmax && ymin <= ymax && zmin <= zmax; }
 };
 
-static inline bool parse_xyzw(const char* s, double& x, double& y, double& z, double& w) {
-    while (*s == ' ' || *s == '\t') ++s;
-    if (*s == '\0' || *s == '\n' || *s == '\r' || *s == '#') return false;
-    char* endp;
-    x = std::strtod(s, &endp); if (endp == s) return false; s = endp;
-    y = std::strtod(s, &endp); if (endp == s) return false; s = endp;
-    z = std::strtod(s, &endp); if (endp == s) return false; s = endp;
-    w = std::strtod(s, &endp); if (endp == s) return false;
+static bool load_npy_double(const char* path, std::vector<double>& out,
+                           size_t& rows, size_t& cols) {
+    std::FILE* f = std::fopen(path, "rb");
+    if (!f) { std::perror("fopen"); return false; }
+    unsigned char magic[6];
+    if (std::fread(magic,1,6,f)!=6 || magic[0]!=0x93 || std::memcmp(magic+1,"NUMPY",5)!=0) {
+        std::fprintf(stderr, "%s: not a .npy file\n", path);
+        std::fclose(f);
+        return false;
+    }
+    unsigned char ver[2];
+    if (std::fread(ver,1,2,f)!=2) { std::fclose(f); return false; }
+    size_t header_len;
+    if (ver[0] <= 1) {
+        uint16_t hl;
+        if (std::fread(&hl,2,1,f)!=1) { std::fclose(f); return false; }
+        header_len = hl;
+    } else {
+        uint32_t hl;
+        if (std::fread(&hl,4,1,f)!=1) { std::fclose(f); return false; }
+        header_len = hl;
+    }
+
+    std::string header(header_len, '\0');
+    if (std::fread(header.data(),1,header_len,f)!=header_len) { std::fclose(f); return false; }
+
+    auto get_field = [&](const char* key) -> std::string {
+        std::string k = std::string("'") + key + "'";
+        size_t pos = header.find(k);
+        if (pos == std::string::npos) return {};
+        pos = header.find('\'', pos + k.size());
+        if (pos == std::string::npos) return {};
+        size_t end = header.find('\'', pos + 1);
+        if (end == std::string::npos) return {};
+        return header.substr(pos + 1, end - pos - 1);
+    };
+
+    std::string descr = get_field("descr");
+    size_t word_size = 0;
+    if (descr == "<f8") word_size = 8;
+    else if (descr == "<f4") word_size = 4;
+    else {
+        std::fprintf(stderr, "%s: unsupported descr %s\n", path, descr.c_str());
+        std::fclose(f);
+        return false;
+    }
+
+    size_t pos_shape = header.find("shape");
+    if (pos_shape == std::string::npos) { std::fclose(f); return false; }
+    size_t lparen = header.find('(', pos_shape);
+    size_t rparen = header.find(')', lparen);
+    if (lparen == std::string::npos || rparen == std::string::npos) {
+        std::fclose(f); return false;
+    }
+    std::string shape_str = header.substr(lparen + 1, rparen - lparen - 1);
+    std::vector<size_t> dims;
+    size_t idx = 0;
+    while (idx < shape_str.size()) {
+        while (idx < shape_str.size() && shape_str[idx] == ' ') ++idx;
+        size_t next = shape_str.find(',', idx);
+        if (next == std::string::npos) next = shape_str.size();
+        std::string token = shape_str.substr(idx, next - idx);
+        if (!token.empty()) dims.push_back((size_t)std::strtoull(token.c_str(), nullptr, 10));
+        idx = next + 1;
+    }
+    if (dims.empty()) { std::fclose(f); return false; }
+    rows = dims[0];
+    cols = dims.size() > 1 ? dims[1] : 1;
+    size_t count = rows * cols;
+
+    out.resize(count);
+    if (descr == "<f8") {
+        if (std::fread(out.data(), word_size, count, f) != count) { std::fclose(f); return false; }
+    } else {
+        std::vector<float> tmp(count);
+        if (std::fread(tmp.data(), word_size, count, f) != count) { std::fclose(f); return false; }
+        for (size_t i = 0; i < count; ++i) out[i] = tmp[i];
+    }
+    std::fclose(f);
     return true;
 }
 
+static bool save_npy_u32_2col(const char* path, const std::vector<uint32_t>& data) {
+    size_t rows = data.size() / 2;
+    std::FILE* f = std::fopen(path, "wb");
+    if (!f) { std::perror("fopen"); return false; }
+    unsigned char magic[6] = {0x93,'N','U','M','P','Y'};
+    unsigned char ver[2] = {1,0};
+    std::string header = "{'descr': '<u4', 'fortran_order': False, 'shape': (" +
+        std::to_string(rows) + ", 2), }";
+    while ((10 + header.size()) % 16 != 0) header.push_back(' ');
+    header.back() = '\n';
+    uint16_t hlen = (uint16_t)header.size();
+    std::fwrite(magic,1,6,f);
+    std::fwrite(ver,1,2,f);
+    std::fwrite(&hlen,2,1,f);
+    std::fwrite(header.data(),1,header.size(),f);
+    std::fwrite(data.data(), sizeof(uint32_t), data.size(), f);
+    std::fclose(f);
+    return true;
+}
+
+
 int main(int argc, char** argv) {
-    if (argc != 3) {
+    if (argc != 4) {
         std::fprintf(stderr,
-            "Usage: %s input.xyzw output.edges\n"
-            "Each input line: x y z w (floats). w is the CGAL power weight (squared radius).\n", argv[0]);
+            "Usage: %s points.npy weights.npy output.npy\n", argv[0]);
         return 1;
     }
-    const char* in_path = argv[1];
-    const char* out_path = argv[2];
+    const char* pts_path = argv[1];
+    const char* w_path  = argv[2];
+    const char* out_path = argv[3];
 
     using K   = CGAL::Exact_predicates_inexact_constructions_kernel;
     using Vb0 = CGAL::Regular_triangulation_vertex_base_3<K>;
@@ -86,51 +176,32 @@ int main(int argc, char** argv) {
     }
     #endif
 
-    std::FILE* fin = std::fopen(in_path, "rb");
-    if (!fin) { std::perror("fopen(input)"); return 2; }
+    std::vector<double> coord_data;
+    size_t nrows=0, ncols=0;
+    if (!load_npy_double(pts_path, coord_data, nrows, ncols) || ncols != 3) {
+        std::fprintf(stderr, "Failed to load %s or unexpected shape\n", pts_path);
+        return 2;
+    }
+    std::vector<double> weight_data;
+    size_t wrows=0, wcols=0;
+    if (!load_npy_double(w_path, weight_data, wrows, wcols) || (wcols != 1 && wcols != 0) || wrows != nrows) {
+        std::fprintf(stderr, "Failed to load %s or mismatched shape\n", w_path);
+        return 2;
+    }
 
     std::vector<std::pair<Weighted_point, uint32_t>> pts;
-    pts.reserve(1<<20);
+    pts.reserve(nrows);
     BBox bb;
-
-    // bulk read
-    {
-        const size_t BUFSZ = size_t(1) << 20;
-        std::vector<char> buf(BUFSZ);
-        std::string acc; acc.reserve(BUFSZ);
-        while (true) {
-            size_t n = std::fread(buf.data(), 1, BUFSZ, fin);
-            if (n == 0) break;
-            for (size_t i = 0; i < n; ++i) {
-                char c = buf[i];
-                if (c == '\r') continue;
-                if (c == '\n') {
-                    double x,y,z,w;
-                    acc.push_back('\0');
-                    if (parse_xyzw(acc.c_str(), x,y,z,w)) {
-                        if (std::isfinite(x) && std::isfinite(y) && std::isfinite(z) && std::isfinite(w)) {
-                            bb.update(x,y,z);
-                            pts.emplace_back(Weighted_point(Bare_point(x,y,z), K::FT(w)),
-                                             (uint32_t)pts.size());
-                        }
-                    }
-                    acc.clear();
-                } else acc.push_back(c);
-            }
-        }
-        if (!acc.empty()) {
-            double x,y,z,w;
-            acc.push_back('\0');
-            if (parse_xyzw(acc.c_str(), x,y,z,w)) {
-                if (std::isfinite(x) && std::isfinite(y) && std::isfinite(z) && std::isfinite(w)) {
-                    bb.update(x,y,z);
-                    pts.emplace_back(Weighted_point(Bare_point(x,y,z), K::FT(w)),
-                                     (uint32_t)pts.size());
-                }
-            }
+    for (size_t i = 0; i < nrows; ++i) {
+        double x = coord_data[3*i];
+        double y = coord_data[3*i+1];
+        double z = coord_data[3*i+2];
+        double w = weight_data[i];
+        if (std::isfinite(x) && std::isfinite(y) && std::isfinite(z) && std::isfinite(w)) {
+            bb.update(x,y,z);
+            pts.emplace_back(Weighted_point(Bare_point(x,y,z), K::FT(w)), (uint32_t)pts.size());
         }
     }
-    std::fclose(fin);
 
     if (pts.size() < 2) {
         std::fprintf(stderr, "Input has < 2 valid points. Nothing to do.\n");
@@ -159,17 +230,8 @@ int main(int argc, char** argv) {
         std::fprintf(stderr, "[warning] CGAL triangulation reports invalid structure.\n");
 
     // Write edges
-    std::FILE* fout = std::fopen(out_path, "wb");
-    if (!fout) { std::perror("fopen(output)"); return 3; }
-    const size_t OUTBUFSZ = size_t(1) << 20;
-    std::vector<char> filebuf(OUTBUFSZ);
-    setvbuf(fout, filebuf.data(), _IOFBF, filebuf.size());
-
-    std::vector<char> outbuf;
-    outbuf.reserve(OUTBUFSZ);
-    auto flush_buf = [&](){ if (!outbuf.empty()) { std::fwrite(outbuf.data(),1,outbuf.size(),fout); outbuf.clear(); } };
-
-    size_t edge_count = 0;
+    std::vector<uint32_t> edges;
+    edges.reserve(rt.number_of_finite_edges()*2);
     for (auto eit = rt.finite_edges_begin(); eit != rt.finite_edges_end(); ++eit) {
         auto c = eit->first;
         int i = eit->second, j = eit->third;
@@ -179,14 +241,13 @@ int main(int argc, char** argv) {
         uint32_t a = vi->info(), b = vj->info();
         if (a == b) continue;
         if (a > b) std::swap(a,b);
-        char line[64];
-        int len = std::snprintf(line, sizeof(line), "%u %u\n", a, b);
-        if (outbuf.size() + (size_t)len > OUTBUFSZ) flush_buf();
-        outbuf.insert(outbuf.end(), line, line + len);
-        ++edge_count;
+        edges.push_back(a);
+        edges.push_back(b);
     }
-    flush_buf();
-    std::fclose(fout);
-    std::fprintf(stderr, "[info] Wrote %zu edges to %s\n", edge_count, out_path);
+    if (!save_npy_u32_2col(out_path, edges)) {
+        std::fprintf(stderr, "Failed to write %s\n", out_path);
+        return 3;
+    }
+    std::fprintf(stderr, "[info] Wrote %zu edges to %s\n", edges.size()/2, out_path);
     return 0;
 }
