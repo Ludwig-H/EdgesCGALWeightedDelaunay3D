@@ -20,6 +20,10 @@
 #include <algorithm>
 #include <thread> // hardware_concurrency
 
+#include <boost/property_map/property_map.hpp>
+#include <CGAL/Spatial_sort_traits_adapter_3.h>
+#include <CGAL/spatial_sort.h>
+
 #ifdef CGAL_LINKED_WITH_TBB
   #include <tbb/global_control.h>
 #endif
@@ -37,6 +41,20 @@ struct BBox {
     }
     bool valid() const { return xmin <= xmax && ymin <= ymax && zmin <= zmax; }
 };
+
+template <typename WeightedPoint, typename BarePoint>
+struct Weighted_point_to_bare_point_map {
+    using key_type = std::pair<WeightedPoint, uint32_t>;
+    using value_type = BarePoint;
+    using reference = BarePoint;
+    using category = boost::readable_property_map_tag;
+};
+
+template <typename WeightedPoint, typename BarePoint>
+BarePoint get(const Weighted_point_to_bare_point_map<WeightedPoint, BarePoint>&,
+              const typename Weighted_point_to_bare_point_map<WeightedPoint, BarePoint>::key_type& key) {
+    return key.first.point();
+}
 
 static bool load_npy_double(const char* path, std::vector<double>& out,
                            size_t& rows, size_t& cols) {
@@ -210,6 +228,11 @@ int main(int argc, char** argv) {
         return 0;
     }
     std::fprintf(stderr, "[info] Loaded %zu points\n", pts.size());
+
+    using Weighted_point_map = Weighted_point_to_bare_point_map<Weighted_point, Bare_point>;
+    CGAL::Spatial_sort_traits_adapter_3<K, Weighted_point_map> traits;
+    CGAL::spatial_sort(pts.begin(), pts.end(), traits);
+    std::fprintf(stderr, "[info] Spatially sorted points prior to insertion\n");
 
     // Triangulation
     #ifdef CGAL_LINKED_WITH_TBB
