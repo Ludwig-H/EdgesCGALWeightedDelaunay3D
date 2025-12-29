@@ -7,15 +7,16 @@ if(NOT CMAKE_BUILD_TYPE)
   set(CMAKE_BUILD_TYPE Release CACHE STRING "Build type" FORCE)
 endif()
 
-# Silence Boost CMP0167 dev warning in newer CMake without changing user policies
 if(POLICY CMP0167)
   cmake_policy(SET CMP0167 NEW)
 endif()
 
+# Dependencies
 find_package(CGAL REQUIRED)
-# Try TBB; enable parallel mode only if we also find tbbmalloc
 find_package(TBB QUIET)
+find_package(Eigen3 REQUIRED)
 
+# TBB Handling
 set(USE_TBB OFF)
 set(TBB_MALLOC_TARGET "")
 if(TBB_FOUND)
@@ -25,7 +26,6 @@ if(TBB_FOUND)
   if(TARGET TBB::tbbmalloc)
     set(TBB_MALLOC_TARGET TBB::tbbmalloc)
   else()
-    # Fallback: search the lib directly (Debian/Ubuntu often split it)
     find_library(TBBMALLOC_LIB tbbmalloc)
     if(TBBMALLOC_LIB)
       set(TBB_MALLOC_TARGET ${TBBMALLOC_LIB})
@@ -37,17 +37,37 @@ if(TBB_FOUND)
   endif()
 endif()
 
+# Common Compilation Flags
+function(set_perf_flags target_name)
+    if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
+        target_compile_options(${target_name} PRIVATE -O3 -DNDEBUG -march=native)
+    elseif(MSVC)
+        target_compile_options(${target_name} PRIVATE /O2 /DNDEBUG)
+    endif()
+    
+    if(USE_TBB)
+        target_link_libraries(${target_name} PRIVATE TBB::tbb ${TBB_MALLOC_TARGET})
+        target_compile_definitions(${target_name} PRIVATE CGAL_LINKED_WITH_TBB)
+    endif()
+endfunction()
+
+# -------------------------------------------------------------------------
+# Original Tool (Preserved)
+# -------------------------------------------------------------------------
 add_executable(EdgesCGALWeightedDelaunay3D src/EdgesCGALWeightedDelaunay3D.cpp)
 target_link_libraries(EdgesCGALWeightedDelaunay3D PRIVATE CGAL::CGAL)
+set_perf_flags(EdgesCGALWeightedDelaunay3D)
 
-if(USE_TBB)
-  target_link_libraries(EdgesCGALWeightedDelaunay3D PRIVATE TBB::tbb ${TBB_MALLOC_TARGET})
-  target_compile_definitions(EdgesCGALWeightedDelaunay3D PRIVATE CGAL_LINKED_WITH_TBB)
+# -------------------------------------------------------------------------
+# New Order-K Tool
+# -------------------------------------------------------------------------
+add_executable(OrderKDelaunay src/CGAL_OrderK/main.cpp)
+if(TARGET Eigen3::Eigen)
+  target_link_libraries(OrderKDelaunay PRIVATE CGAL::CGAL Eigen3::Eigen)
+else()
+  target_link_libraries(OrderKDelaunay PRIVATE CGAL::CGAL)
+  target_include_directories(OrderKDelaunay PRIVATE ${EIGEN3_INCLUDE_DIR})
 endif()
-
-# Speed knobs
-if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
-  target_compile_options(EdgesCGALWeightedDelaunay3D PRIVATE -O3 -DNDEBUG -march=native)
-elseif(MSVC)
-  target_compile_options(EdgesCGALWeightedDelaunay3D PRIVATE /O2 /DNDEBUG)
-endif()
+set_perf_flags(OrderKDelaunay)
+# CGAL 5.0+ usually includes Eigen if needed for dD, but dD regular triangulation 
+# might require explicit linking if not header-only. Usually header only.
